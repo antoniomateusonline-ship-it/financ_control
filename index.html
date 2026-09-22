@@ -373,7 +373,7 @@ function setData(mutator){ mutator(data); persist(); render(); scheduleAutoPush(
      pedidas de novo depois de configuradas.
 ================================================================= */
 const SYNC_CFG_KEY = "financas-sync-cfg-v1";
-const SYNC_TABLE = "financas_sync";
+const SYNC_TABLE_DEFAULT = "financas_sync";
 const SYNC_AUTO_PUSH_DELAY = 4000;  // ms após uma alteração, antes de enviar sozinho
 const SYNC_AUTO_PULL_EVERY = 20000; // ms entre verificações se há algo novo no servidor
 
@@ -384,10 +384,10 @@ let syncBusy = false;
 function loadSyncCfg(){
   try{
     const raw = localStorage.getItem(SYNC_CFG_KEY);
-    return raw ? { url:"", key:"", rowId:"principal", auto:false, lastSyncedAt:null, ...JSON.parse(raw) }
-                : { url:"", key:"", rowId:"principal", auto:false, lastSyncedAt:null };
+    return raw ? { url:"", key:"", table:SYNC_TABLE_DEFAULT, rowId:"principal", auto:false, lastSyncedAt:null, ...JSON.parse(raw) }
+                : { url:"", key:"", table:SYNC_TABLE_DEFAULT, rowId:"principal", auto:false, lastSyncedAt:null };
   }catch(e){
-    return { url:"", key:"", rowId:"principal", auto:false, lastSyncedAt:null };
+    return { url:"", key:"", table:SYNC_TABLE_DEFAULT, rowId:"principal", auto:false, lastSyncedAt:null };
   }
 }
 function saveSyncCfg(patch){
@@ -402,6 +402,22 @@ function cleanSupabaseUrl(url){
   return (url||"").trim().replace(/\/+$/,"");
 }
 
+function syncTableName(cfg){ return (cfg.table||"").trim() || SYNC_TABLE_DEFAULT; }
+function friendlySyncError(rawText, cfg){
+  try{
+    const j = JSON.parse(rawText);
+    if(j.code === "PGRST205"){
+      return `A tabela "${syncTableName(cfg)}" não foi encontrada nesse projeto Supabase.\n\n`+
+        `Confira:\n`+
+        `1. Você rodou o SQL de criação da tabela no MESMO projeto cuja URL está preenchida aqui em cima?\n`+
+        `2. O campo "Nome da tabela" está escrito exatamente igual ao nome que você criou (maiúsculas/minúsculas importam)?\n`+
+        `3. No painel do Supabase, vá em Project Settings → API e clique em "Reload schema" — às vezes o cache demora a atualizar depois de criar uma tabela nova.`;
+    }
+    if(j.message) return j.message + (j.hint ? `\n(dica do Supabase: ${j.hint})` : "");
+  }catch(e){}
+  return rawText;
+}
+
 async function runPushToSupabase(silent){
   const cfg = loadSyncCfg();
   const url = cleanSupabaseUrl(cfg.url);
@@ -410,17 +426,17 @@ async function runPushToSupabase(silent){
   syncBusy = true;
   try{
     const payload = [{ id: cfg.rowId || "principal", dados: data, atualizado_em: new Date().toISOString() }];
-    const res = await fetch(`${url}/rest/v1/${SYNC_TABLE}?on_conflict=id`, {
+    const res = await fetch(`${url}/rest/v1/${syncTableName(cfg)}?on_conflict=id`, {
       method: "POST",
       headers: { ...syncHeaders(cfg), "Prefer": "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify(payload),
     });
-    if(!res.ok) throw new Error((await res.text()) || `Erro ${res.status}`);
+    if(!res.ok) throw new Error(friendlySyncError(await res.text(), cfg));
     saveSyncCfg({ lastSyncedAt: new Date().toISOString() });
     if(!silent) showToast("Dados enviados ao Supabase");
     if(ui.subpage === "config") openSubpage("config");
   }catch(e){
-    if(!silent) alert("Não foi possível enviar ao Supabase:\n"+e.message);
+    if(!silent) alert("Não foi possível enviar ao Supabase:\n\n"+e.message);
   }finally{
     syncBusy = false;
   }
@@ -434,10 +450,10 @@ async function runPullFromSupabase(silent){
   if(syncBusy) return;
   syncBusy = true;
   try{
-    const res = await fetch(`${url}/rest/v1/${SYNC_TABLE}?id=eq.${encodeURIComponent(cfg.rowId||"principal")}&select=dados,atualizado_em`, {
+    const res = await fetch(`${url}/rest/v1/${syncTableName(cfg)}?id=eq.${encodeURIComponent(cfg.rowId||"principal")}&select=dados,atualizado_em`, {
       headers: syncHeaders(cfg),
     });
-    if(!res.ok) throw new Error((await res.text()) || `Erro ${res.status}`);
+    if(!res.ok) throw new Error(friendlySyncError(await res.text(), cfg));
     const rows = await res.json();
     if(!rows.length){ if(!silent) showToast("Ainda não há nada salvo no Supabase para este aparelho"); syncBusy=false; return; }
     if(!silent && !confirm("Isso vai SUBSTITUIR os dados deste aparelho pelos dados salvos no Supabase. Continuar?")){ syncBusy=false; return; }
@@ -448,7 +464,7 @@ async function runPullFromSupabase(silent){
     if(!silent) showToast("Dados atualizados a partir do Supabase");
     else showToast("Sincronizado com outro aparelho");
   }catch(e){
-    if(!silent) alert("Não foi possível puxar do Supabase:\n"+e.message);
+    if(!silent) alert("Não foi possível puxar do Supabase:\n\n"+e.message);
   }finally{
     syncBusy = false;
   }
@@ -469,7 +485,7 @@ function startAutoPull(){
     const url = cleanSupabaseUrl(cfg.url);
     if(!cfg.auto || !url || !cfg.key || syncBusy) return;
     try{
-      const res = await fetch(`${url}/rest/v1/${SYNC_TABLE}?id=eq.${encodeURIComponent(cfg.rowId||"principal")}&select=atualizado_em`, { headers: syncHeaders(cfg) });
+      const res = await fetch(`${url}/rest/v1/${syncTableName(cfg)}?id=eq.${encodeURIComponent(cfg.rowId||"principal")}&select=atualizado_em`, { headers: syncHeaders(cfg) });
       if(!res.ok) return;
       const rows = await res.json();
       if(!rows.length) return;
@@ -1956,6 +1972,8 @@ function renderSyncSection(){
         <input value="${esc(cfg.url||"")}" placeholder="https://xxxxx.supabase.co" onchange="saveSyncField('url', this.value)"></div>
       <div class="field"><label class="field-label">Chave anon (public)</label>
         <input value="${esc(cfg.key||"")}" placeholder="eyJhbGciOi..." onchange="saveSyncField('key', this.value)"></div>
+      <div class="field"><label class="field-label">Nome da tabela no Supabase</label>
+        <input value="${esc(cfg.table||SYNC_TABLE_DEFAULT)}" placeholder="${SYNC_TABLE_DEFAULT}" onchange="saveSyncField('table', this.value)"></div>
       <div class="field"><label class="field-label">Identificador deste conjunto de dados</label>
         <input value="${esc(cfg.rowId||"principal")}" placeholder="principal" onchange="saveSyncField('rowId', this.value)"></div>
 
