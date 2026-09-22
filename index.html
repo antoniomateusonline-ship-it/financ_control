@@ -364,7 +364,136 @@ function persist(){
   try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }
   catch(e){ showToast("Não foi possível salvar (armazenamento cheio ou bloqueado)"); }
 }
-function setData(mutator){ mutator(data); persist(); render(); }
+function setData(mutator){ mutator(data); persist(); render(); scheduleAutoPush(); }
+
+/* =================================================================
+   Sincronização entre aparelhos via Supabase
+   - Não é mesclagem inteligente: quem enviar por último prevalece.
+   - URL/chave ficam salvas só neste navegador (localStorage), nunca
+     pedidas de novo depois de configuradas.
+================================================================= */
+const SYNC_CFG_KEY = "financas-sync-cfg-v1";
+const SYNC_TABLE = "financas_sync";
+const SYNC_AUTO_PUSH_DELAY = 4000;  // ms após uma alteração, antes de enviar sozinho
+const SYNC_AUTO_PULL_EVERY = 20000; // ms entre verificações se há algo novo no servidor
+
+let syncPushTimer = null;
+let syncPullInterval = null;
+let syncBusy = false;
+
+function loadSyncCfg(){
+  try{
+    const raw = localStorage.getItem(SYNC_CFG_KEY);
+    return raw ? { url:"", key:"", rowId:"principal", auto:false, lastSyncedAt:null, ...JSON.parse(raw) }
+                : { url:"", key:"", rowId:"principal", auto:false, lastSyncedAt:null };
+  }catch(e){
+    return { url:"", key:"", rowId:"principal", auto:false, lastSyncedAt:null };
+  }
+}
+function saveSyncCfg(patch){
+  const cfg = { ...loadSyncCfg(), ...patch };
+  try{ localStorage.setItem(SYNC_CFG_KEY, JSON.stringify(cfg)); }catch(e){}
+  return cfg;
+}
+function syncHeaders(cfg){
+  return { "apikey": cfg.key, "Authorization": `Bearer ${cfg.key}`, "Content-Type": "application/json" };
+}
+function cleanSupabaseUrl(url){
+  return (url||"").trim().replace(/\/+$/,"");
+}
+
+async function runPushToSupabase(silent){
+  const cfg = loadSyncCfg();
+  const url = cleanSupabaseUrl(cfg.url);
+  if(!url || !cfg.key){ if(!silent) showToast("Preencha a URL e a chave do Supabase primeiro"); return; }
+  if(syncBusy) return;
+  syncBusy = true;
+  try{
+    const payload = [{ id: cfg.rowId || "principal", dados: data, atualizado_em: new Date().toISOString() }];
+    const res = await fetch(`${url}/rest/v1/${SYNC_TABLE}?on_conflict=id`, {
+      method: "POST",
+      headers: { ...syncHeaders(cfg), "Prefer": "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(payload),
+    });
+    if(!res.ok) throw new Error((await res.text()) || `Erro ${res.status}`);
+    saveSyncCfg({ lastSyncedAt: new Date().toISOString() });
+    if(!silent) showToast("Dados enviados ao Supabase");
+    if(ui.subpage === "config") openSubpage("config");
+  }catch(e){
+    if(!silent) alert("Não foi possível enviar ao Supabase:\n"+e.message);
+  }finally{
+    syncBusy = false;
+  }
+}
+window.pushToSupabase = () => runPushToSupabase(false);
+
+async function runPullFromSupabase(silent){
+  const cfg = loadSyncCfg();
+  const url = cleanSupabaseUrl(cfg.url);
+  if(!url || !cfg.key){ if(!silent) showToast("Preencha a URL e a chave do Supabase primeiro"); return; }
+  if(syncBusy) return;
+  syncBusy = true;
+  try{
+    const res = await fetch(`${url}/rest/v1/${SYNC_TABLE}?id=eq.${encodeURIComponent(cfg.rowId||"principal")}&select=dados,atualizado_em`, {
+      headers: syncHeaders(cfg),
+    });
+    if(!res.ok) throw new Error((await res.text()) || `Erro ${res.status}`);
+    const rows = await res.json();
+    if(!rows.length){ if(!silent) showToast("Ainda não há nada salvo no Supabase para este aparelho"); syncBusy=false; return; }
+    if(!silent && !confirm("Isso vai SUBSTITUIR os dados deste aparelho pelos dados salvos no Supabase. Continuar?")){ syncBusy=false; return; }
+    data = migrateData(rows[0].dados);
+    persist();
+    render();
+    saveSyncCfg({ lastSyncedAt: new Date().toISOString() });
+    if(!silent) showToast("Dados atualizados a partir do Supabase");
+    else showToast("Sincronizado com outro aparelho");
+  }catch(e){
+    if(!silent) alert("Não foi possível puxar do Supabase:\n"+e.message);
+  }finally{
+    syncBusy = false;
+  }
+}
+window.pullFromSupabase = () => runPullFromSupabase(false);
+
+function scheduleAutoPush(){
+  const cfg = loadSyncCfg();
+  if(!cfg.auto || !cleanSupabaseUrl(cfg.url) || !cfg.key) return;
+  clearTimeout(syncPushTimer);
+  syncPushTimer = setTimeout(() => runPushToSupabase(true), SYNC_AUTO_PUSH_DELAY);
+}
+
+function startAutoPull(){
+  clearInterval(syncPullInterval);
+  syncPullInterval = setInterval(async () => {
+    const cfg = loadSyncCfg();
+    const url = cleanSupabaseUrl(cfg.url);
+    if(!cfg.auto || !url || !cfg.key || syncBusy) return;
+    try{
+      const res = await fetch(`${url}/rest/v1/${SYNC_TABLE}?id=eq.${encodeURIComponent(cfg.rowId||"principal")}&select=atualizado_em`, { headers: syncHeaders(cfg) });
+      if(!res.ok) return;
+      const rows = await res.json();
+      if(!rows.length) return;
+      const remoteTime = new Date(rows[0].atualizado_em).getTime();
+      const localTime = cfg.lastSyncedAt ? new Date(cfg.lastSyncedAt).getTime() : 0;
+      if(remoteTime > localTime + 2000) await runPullFromSupabase(true);
+    }catch(e){ /* falha silenciosa: tenta de novo no próximo ciclo */ }
+  }, SYNC_AUTO_PULL_EVERY);
+}
+
+function saveSyncField(field, value){
+  saveSyncCfg({ [field]: value });
+}
+window.saveSyncField = saveSyncField;
+
+function toggleSyncAuto(){
+  const cfg = loadSyncCfg();
+  const url = cleanSupabaseUrl(cfg.url);
+  if(!cfg.auto && (!url || !cfg.key)){ showToast("Preencha a URL e a chave do Supabase antes de ativar"); return; }
+  saveSyncCfg({ auto: !cfg.auto });
+  if(!cfg.auto) startAutoPull();
+  openSubpage("config");
+}
+window.toggleSyncAuto = toggleSyncAuto;
 
 function showToast(msg){
   const t = document.getElementById("toast");
@@ -1812,6 +1941,44 @@ function removeCategory(id){
 }
 window.removeCategory = removeCategory;
 
+function renderSyncSection(){
+  const cfg = loadSyncCfg();
+  const configured = !!(cleanSupabaseUrl(cfg.url) && cfg.key);
+  const lastSync = cfg.lastSyncedAt ? new Date(cfg.lastSyncedAt).toLocaleString("pt-BR") : "nunca";
+  return `
+    <div class="card" style="margin-bottom:12px;">
+      <div style="font-size:14px;font-weight:700;margin-bottom:4px;">Sincronização entre aparelhos</div>
+      <div style="font-size:12.5px;color:var(--text-muted);margin-bottom:10px;line-height:1.4;">
+        Use o mesmo Supabase em outro celular/computador para ver os mesmos dados nos dois. <strong>Não é uma mesclagem inteligente</strong>: quem enviar por último apaga o que o outro aparelho tinha mandado antes. A URL e a chave ficam salvas só neste navegador.
+      </div>
+
+      <div class="field"><label class="field-label">URL do projeto Supabase</label>
+        <input value="${esc(cfg.url||"")}" placeholder="https://xxxxx.supabase.co" onchange="saveSyncField('url', this.value)"></div>
+      <div class="field"><label class="field-label">Chave anon (public)</label>
+        <input value="${esc(cfg.key||"")}" placeholder="eyJhbGciOi..." onchange="saveSyncField('key', this.value)"></div>
+      <div class="field"><label class="field-label">Identificador deste conjunto de dados</label>
+        <input value="${esc(cfg.rowId||"principal")}" placeholder="principal" onchange="saveSyncField('rowId', this.value)"></div>
+
+      <div class="between" style="margin:4px 0 12px;">
+        <div>
+          <div style="font-size:13px;font-weight:700;">Sincronizar automaticamente</div>
+          <div style="font-size:11px;color:var(--text-muted);">Envia sozinho após alterações e verifica a cada ~20s</div>
+        </div>
+        <button onclick="toggleSyncAuto()" style="width:46px;height:26px;border-radius:13px;background:${cfg.auto?"var(--positive)":"var(--border)"};border:none;cursor:pointer;position:relative;flex-shrink:0;">
+          <div style="width:20px;height:20px;border-radius:10px;background:#fff;position:absolute;top:3px;left:${cfg.auto?23:3}px;transition:left .2s;"></div>
+        </button>
+      </div>
+
+      <div style="display:flex;gap:8px;margin-bottom:8px;">
+        <button class="btn-ghost" style="flex:1;" onclick="pushToSupabase()">Enviar agora</button>
+        <button class="btn-ghost" style="flex:1;" onclick="pullFromSupabase()">Puxar agora</button>
+      </div>
+      <div style="font-size:11px;color:var(--text-muted);">
+        ${configured ? `Última sincronização: ${lastSync}` : "Preencha a URL e a chave para ativar"}
+      </div>
+    </div>`;
+}
+
 /* --- Painel: Configurações --- */
 function renderSettingsPanel(){
   return `
@@ -1838,6 +2005,8 @@ function renderSettingsPanel(){
         <input type="file" accept="application/json" onchange="restoreBackupFile(this)" style="display:none;">
       </label>
     </div>
+
+    ${renderSyncSection()}
 
     <div class="card" style="margin-bottom:12px;">
       <div style="font-size:14px;font-weight:700;margin-bottom:8px;">Exportar dados</div>
@@ -2048,6 +2217,7 @@ function bindGlobalEvents(){
    Início
 ================================================================= */
 loadData();
+if(loadSyncCfg().auto) startAutoPull();
 
 if("serviceWorker" in navigator){
   window.addEventListener("load", ()=>{
