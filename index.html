@@ -13,8 +13,12 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Finanças">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600;700&display=swap');
+
+  #authScreen{ min-height:100vh; display:none; align-items:center; justify-content:center; padding:24px; background:var(--bg); }
+  .auth-card{ width:100%; max-width:360px; background:var(--surface); border:1px solid var(--border); border-radius:18px; padding:28px 24px; }
 
   :root[data-theme="light"]{
     --bg:#F6F5F0; --surface:#FFFFFF; --surface-alt:#F0EEE7; --text:#182620;
@@ -105,6 +109,7 @@
 </style>
 </head>
 <body>
+<div id="authScreen"></div>
 <div id="shell">
   <div id="content"></div>
   <nav id="bottomnav"></nav>
@@ -350,166 +355,259 @@ function hiddenPlaceholder(h){
   </div>`;
 }
 
-function loadData(){
-  try{
-    const raw = localStorage.getItem(STORAGE_KEY);
-    data = raw ? migrateData(JSON.parse(raw)) : emptyData();
-  }catch(e){
-    data = emptyData();
+/* =================================================================
+   Configuração do Supabase (login multiusuário)
+   Preencha estes dois valores com os dados do SEU projeto Supabase
+   antes de publicar o app (Project Settings → API no painel do
+   Supabase). Sem isso preenchido, o app mostra uma tela avisando que
+   falta configurar, em vez de travar sem explicação.
+================================================================= */
+const SUPABASE_URL = "COLE_AQUI_A_URL_DO_SEU_PROJETO_SUPABASE";
+const SUPABASE_ANON_KEY = "COLE_AQUI_A_CHAVE_ANON_PUBLIC";
+const SYNC_TABLE = "financas_sync";
+const SYNC_AUTO_PULL_EVERY = 20000; // ms entre verificações se há algo novo salvo em outro aparelho
+const SYNC_AUTO_PUSH_DELAY = 4000;  // ms após uma alteração, antes de enviar sozinho pra nuvem
+
+const sb = (SUPABASE_URL.indexOf("http") === 0 && SUPABASE_ANON_KEY.length > 20)
+  ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+  : null;
+
+let currentUser = null;     // usuário autenticado (do Supabase Auth)
+let currentProfile = null;  // { id, email, is_admin }
+let authError = "";
+let authNotice = "";
+let authBusy = false;
+let syncBusy = false;
+let syncPushTimer = null;
+let syncPullInterval = null;
+let lastKnownRemoteTime = null;
+let adminUsersCache = null;
+
+function storageKeyFor(userId){ return STORAGE_KEY + "-" + userId; }
+
+function showAuthScreen(){
+  document.getElementById("shell").style.display = "none";
+  const el = document.getElementById("authScreen");
+  el.style.display = "flex";
+}
+function showApp(){
+  document.getElementById("authScreen").style.display = "none";
+  document.getElementById("shell").style.display = "block";
+}
+
+function renderConfigMissingScreen(){
+  showAuthScreen();
+  document.getElementById("authScreen").innerHTML = `
+    <div class="auth-card">
+      <div class="serif" style="font-size:18px;font-weight:600;margin-bottom:10px;">Configuração pendente</div>
+      <div style="font-size:13px;color:var(--text-muted);line-height:1.6;">
+        Este app ainda não tem um projeto Supabase configurado. Abra o arquivo <code>index.html</code>, procure por <code>SUPABASE_URL</code> e <code>SUPABASE_ANON_KEY</code> perto do início do script, e preencha com os dados do seu projeto (Project Settings → API no painel do Supabase).
+      </div>
+    </div>`;
+}
+
+function renderAuthScreen(){
+  const el = document.getElementById("authScreen");
+  el.innerHTML = `
+    <div class="auth-card">
+      <div style="text-align:center;margin-bottom:20px;">
+        <div class="serif" style="font-size:22px;font-weight:600;">Finanças</div>
+        <div style="font-size:12.5px;color:var(--text-muted);margin-top:4px;">Entrar na sua conta</div>
+      </div>
+      <div class="field"><label class="field-label">E-mail</label><input id="auth-email" type="email" autocomplete="username" placeholder="voce@email.com"></div>
+      <div class="field"><label class="field-label">Senha</label><input id="auth-password" type="password" autocomplete="current-password" placeholder="••••••••" onkeydown="if(event.key==='Enter') doLogin();"></div>
+      ${authError ? `<div style="font-size:12.5px;color:var(--negative);margin-bottom:10px;line-height:1.4;">${esc(authError)}</div>` : ""}
+      ${authNotice ? `<div style="font-size:12.5px;color:var(--positive);margin-bottom:10px;line-height:1.4;">${esc(authNotice)}</div>` : ""}
+      <button class="btn-primary" style="margin-bottom:10px;" onclick="doLogin()" ${authBusy?"disabled":""}>${authBusy ? "Entrando…" : "Entrar"}</button>
+      <div style="text-align:center;font-size:12px;">
+        <a href="#" onclick="doResetPassword();return false;" style="color:var(--info);font-weight:600;text-decoration:none;">Esqueci minha senha</a>
+      </div>
+      <div style="text-align:center;font-size:11.5px;color:var(--text-muted);margin-top:16px;line-height:1.4;">
+        Os acessos são criados por um administrador. Se você ainda não tem uma conta, peça para quem administra este app te cadastrar.
+      </div>
+    </div>`;
+}
+
+async function doLogin(){
+  const email = (document.getElementById("auth-email").value||"").trim();
+  const password = document.getElementById("auth-password").value||"";
+  if(!email || !password){ authError = "Preencha e-mail e senha."; authNotice=""; renderAuthScreen(); return; }
+  authBusy = true; authError = ""; authNotice=""; renderAuthScreen();
+  const { error } = await sb.auth.signInWithPassword({ email, password });
+  authBusy = false;
+  if(error){
+    authError = /invalid login credentials/i.test(error.message) ? "E-mail ou senha incorretos." : error.message;
+    renderAuthScreen();
   }
+  // se der certo, onAuthStateChange cuida do resto
+}
+window.doLogin = doLogin;
+
+async function doResetPassword(){
+  const email = (document.getElementById("auth-email").value||"").trim();
+  if(!email){ authError = "Digite seu e-mail no campo acima e clique de novo em \"Esqueci minha senha\"."; authNotice=""; renderAuthScreen(); return; }
+  authError = ""; authNotice = "Enviando...";
+  renderAuthScreen();
+  const { error } = await sb.auth.resetPasswordForEmail(email);
+  if(error){ authError = error.message; authNotice = ""; }
+  else{ authError = ""; authNotice = "Se esse e-mail estiver cadastrado, enviamos um link de recuperação para ele."; }
+  renderAuthScreen();
+}
+window.doResetPassword = doResetPassword;
+
+async function doLogout(){
+  if(!confirm("Sair da sua conta neste aparelho?")) return;
+  clearInterval(syncPullInterval);
+  clearTimeout(syncPushTimer);
+  await sb.auth.signOut();
+}
+window.doLogout = doLogout;
+
+async function loadProfile(){
+  try{
+    const { data: rows, error } = await sb.from("profiles").select("id,email,is_admin").eq("id", currentUser.id).limit(1);
+    if(error) throw error;
+    currentProfile = (rows && rows[0]) || { id: currentUser.id, email: currentUser.email, is_admin:false };
+  }catch(e){
+    currentProfile = { id: currentUser.id, email: currentUser.email, is_admin:false };
+  }
+}
+
+async function loadAllProfilesForAdmin(){
+  try{
+    const { data: rows, error } = await sb.from("profiles").select("id,email,is_admin,created_at").order("created_at",{ascending:true});
+    if(error) throw error;
+    return rows || [];
+  }catch(e){
+    return [];
+  }
+}
+
+async function initialSync(){
+  const cacheRaw = (()=>{ try{ return localStorage.getItem(storageKeyFor(currentUser.id)); }catch(e){ return null; } })();
+  try{
+    const { data: rows, error } = await sb.from(SYNC_TABLE).select("dados,atualizado_em").eq("user_id", currentUser.id).limit(1);
+    if(error) throw error;
+    if(rows && rows.length){
+      data = migrateData(rows[0].dados);
+      lastKnownRemoteTime = rows[0].atualizado_em;
+      persist();
+    }else{
+      // primeiro acesso desse usuário: usa cache local se existir (ou vazio) e cria a linha na nuvem
+      data = cacheRaw ? migrateData(JSON.parse(cacheRaw)) : emptyData();
+      persist();
+      await runPushNow(true);
+    }
+  }catch(e){
+    data = cacheRaw ? migrateData(JSON.parse(cacheRaw)) : emptyData();
+    showToast("Sem conexão com o servidor agora — usando dados salvos neste aparelho");
+  }
+}
+
+async function handleSignedIn(user){
+  currentUser = user;
+  showApp();
+  document.getElementById("content").innerHTML = '<div style="padding:60px 20px;text-align:center;color:var(--text-muted)">Carregando seus dados…</div>';
+  await loadProfile();
+  await initialSync();
   loaded = true;
   render();
+  startAutoPull();
 }
+
+async function initAuth(){
+  document.documentElement.setAttribute("data-theme", "light");
+  if(!sb){ renderConfigMissingScreen(); return; }
+  const { data: sessionData } = await sb.auth.getSession();
+  if(sessionData && sessionData.session){
+    await handleSignedIn(sessionData.session.user);
+  }else{
+    showAuthScreen();
+    renderAuthScreen();
+  }
+  sb.auth.onAuthStateChange((event, session)=>{
+    if(event === "SIGNED_IN" && session && (!currentUser || currentUser.id !== session.user.id)){
+      handleSignedIn(session.user);
+    }else if(event === "SIGNED_OUT"){
+      currentUser = null; currentProfile = null; data = null; loaded = false; adminUsersCache = null;
+      clearInterval(syncPullInterval);
+      clearTimeout(syncPushTimer);
+      showAuthScreen();
+      renderAuthScreen();
+    }
+  });
+}
+
 function persist(){
-  try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }
+  if(!currentUser) return;
+  try{ localStorage.setItem(storageKeyFor(currentUser.id), JSON.stringify(data)); }
   catch(e){ showToast("Não foi possível salvar (armazenamento cheio ou bloqueado)"); }
 }
 function setData(mutator){ mutator(data); persist(); render(); scheduleAutoPush(); }
 
-/* =================================================================
-   Sincronização entre aparelhos via Supabase
-   - Não é mesclagem inteligente: quem enviar por último prevalece.
-   - URL/chave ficam salvas só neste navegador (localStorage), nunca
-     pedidas de novo depois de configuradas.
-================================================================= */
-const SYNC_CFG_KEY = "financas-sync-cfg-v1";
-const SYNC_TABLE_DEFAULT = "financas_sync";
-const SYNC_AUTO_PUSH_DELAY = 4000;  // ms após uma alteração, antes de enviar sozinho
-const SYNC_AUTO_PULL_EVERY = 20000; // ms entre verificações se há algo novo no servidor
-
-let syncPushTimer = null;
-let syncPullInterval = null;
-let syncBusy = false;
-
-function loadSyncCfg(){
-  try{
-    const raw = localStorage.getItem(SYNC_CFG_KEY);
-    return raw ? { url:"", key:"", table:SYNC_TABLE_DEFAULT, rowId:"principal", auto:false, lastSyncedAt:null, ...JSON.parse(raw) }
-                : { url:"", key:"", table:SYNC_TABLE_DEFAULT, rowId:"principal", auto:false, lastSyncedAt:null };
-  }catch(e){
-    return { url:"", key:"", table:SYNC_TABLE_DEFAULT, rowId:"principal", auto:false, lastSyncedAt:null };
-  }
-}
-function saveSyncCfg(patch){
-  const cfg = { ...loadSyncCfg(), ...patch };
-  try{ localStorage.setItem(SYNC_CFG_KEY, JSON.stringify(cfg)); }catch(e){}
-  return cfg;
-}
-function syncHeaders(cfg){
-  return { "apikey": cfg.key, "Authorization": `Bearer ${cfg.key}`, "Content-Type": "application/json" };
-}
-function cleanSupabaseUrl(url){
-  return (url||"").trim().replace(/\/+$/,"");
-}
-
-function syncTableName(cfg){ return (cfg.table||"").trim() || SYNC_TABLE_DEFAULT; }
-function friendlySyncError(rawText, cfg){
-  try{
-    const j = JSON.parse(rawText);
-    if(j.code === "PGRST205"){
-      return `A tabela "${syncTableName(cfg)}" não foi encontrada nesse projeto Supabase.\n\n`+
-        `Confira:\n`+
-        `1. Você rodou o SQL de criação da tabela no MESMO projeto cuja URL está preenchida aqui em cima?\n`+
-        `2. O campo "Nome da tabela" está escrito exatamente igual ao nome que você criou (maiúsculas/minúsculas importam)?\n`+
-        `3. No painel do Supabase, vá em Project Settings → API e clique em "Reload schema" — às vezes o cache demora a atualizar depois de criar uma tabela nova.`;
-    }
-    if(j.message) return j.message + (j.hint ? `\n(dica do Supabase: ${j.hint})` : "");
-  }catch(e){}
-  return rawText;
-}
-
-async function runPushToSupabase(silent){
-  const cfg = loadSyncCfg();
-  const url = cleanSupabaseUrl(cfg.url);
-  if(!url || !cfg.key){ if(!silent) showToast("Preencha a URL e a chave do Supabase primeiro"); return; }
+async function runPushNow(silent){
+  if(!currentUser) return;
   if(syncBusy) return;
   syncBusy = true;
   try{
-    const payload = [{ id: cfg.rowId || "principal", dados: data, atualizado_em: new Date().toISOString() }];
-    const res = await fetch(`${url}/rest/v1/${syncTableName(cfg)}?on_conflict=id`, {
-      method: "POST",
-      headers: { ...syncHeaders(cfg), "Prefer": "resolution=merge-duplicates,return=minimal" },
-      body: JSON.stringify(payload),
-    });
-    if(!res.ok) throw new Error(friendlySyncError(await res.text(), cfg));
-    saveSyncCfg({ lastSyncedAt: new Date().toISOString() });
-    if(!silent) showToast("Dados enviados ao Supabase");
-    if(ui.subpage === "config") openSubpage("config");
+    const nowIso = new Date().toISOString();
+    const { error } = await sb.from(SYNC_TABLE).upsert(
+      { user_id: currentUser.id, dados: data, atualizado_em: nowIso },
+      { onConflict: "user_id" }
+    );
+    if(error) throw error;
+    lastKnownRemoteTime = nowIso;
+    if(!silent) showToast("Dados enviados");
   }catch(e){
-    if(!silent) alert("Não foi possível enviar ao Supabase:\n\n"+e.message);
+    if(!silent) alert("Não foi possível enviar seus dados agora:\n\n"+(e.message||e));
   }finally{
     syncBusy = false;
   }
 }
-window.pushToSupabase = () => runPushToSupabase(false);
+window.pushNow = () => runPushNow(false);
 
-async function runPullFromSupabase(silent){
-  const cfg = loadSyncCfg();
-  const url = cleanSupabaseUrl(cfg.url);
-  if(!url || !cfg.key){ if(!silent) showToast("Preencha a URL e a chave do Supabase primeiro"); return; }
+async function runPullNow(silent){
+  if(!currentUser) return;
   if(syncBusy) return;
   syncBusy = true;
   try{
-    const res = await fetch(`${url}/rest/v1/${syncTableName(cfg)}?id=eq.${encodeURIComponent(cfg.rowId||"principal")}&select=dados,atualizado_em`, {
-      headers: syncHeaders(cfg),
-    });
-    if(!res.ok) throw new Error(friendlySyncError(await res.text(), cfg));
-    const rows = await res.json();
-    if(!rows.length){ if(!silent) showToast("Ainda não há nada salvo no Supabase para este aparelho"); syncBusy=false; return; }
-    if(!silent && !confirm("Isso vai SUBSTITUIR os dados deste aparelho pelos dados salvos no Supabase. Continuar?")){ syncBusy=false; return; }
+    const { data: rows, error } = await sb.from(SYNC_TABLE).select("dados,atualizado_em").eq("user_id", currentUser.id).limit(1);
+    if(error) throw error;
+    if(!rows || !rows.length){ if(!silent) showToast("Nada encontrado no servidor ainda"); syncBusy=false; return; }
+    if(!silent && !confirm("Isso vai substituir os dados deste aparelho pelos dados salvos no servidor. Continuar?")){ syncBusy=false; return; }
     data = migrateData(rows[0].dados);
+    lastKnownRemoteTime = rows[0].atualizado_em;
     persist();
     render();
-    saveSyncCfg({ lastSyncedAt: new Date().toISOString() });
-    if(!silent) showToast("Dados atualizados a partir do Supabase");
+    if(!silent) showToast("Dados atualizados");
     else showToast("Sincronizado com outro aparelho");
   }catch(e){
-    if(!silent) alert("Não foi possível puxar do Supabase:\n\n"+e.message);
+    if(!silent) alert("Não foi possível buscar seus dados agora:\n\n"+(e.message||e));
   }finally{
     syncBusy = false;
   }
 }
-window.pullFromSupabase = () => runPullFromSupabase(false);
+window.pullNow = () => runPullNow(false);
 
 function scheduleAutoPush(){
-  const cfg = loadSyncCfg();
-  if(!cfg.auto || !cleanSupabaseUrl(cfg.url) || !cfg.key) return;
+  if(!currentUser) return;
   clearTimeout(syncPushTimer);
-  syncPushTimer = setTimeout(() => runPushToSupabase(true), SYNC_AUTO_PUSH_DELAY);
+  syncPushTimer = setTimeout(() => runPushNow(true), SYNC_AUTO_PUSH_DELAY);
 }
 
 function startAutoPull(){
   clearInterval(syncPullInterval);
   syncPullInterval = setInterval(async () => {
-    const cfg = loadSyncCfg();
-    const url = cleanSupabaseUrl(cfg.url);
-    if(!cfg.auto || !url || !cfg.key || syncBusy) return;
+    if(!currentUser || syncBusy) return;
     try{
-      const res = await fetch(`${url}/rest/v1/${syncTableName(cfg)}?id=eq.${encodeURIComponent(cfg.rowId||"principal")}&select=atualizado_em`, { headers: syncHeaders(cfg) });
-      if(!res.ok) return;
-      const rows = await res.json();
-      if(!rows.length) return;
+      const { data: rows, error } = await sb.from(SYNC_TABLE).select("atualizado_em").eq("user_id", currentUser.id).limit(1);
+      if(error || !rows || !rows.length) return;
       const remoteTime = new Date(rows[0].atualizado_em).getTime();
-      const localTime = cfg.lastSyncedAt ? new Date(cfg.lastSyncedAt).getTime() : 0;
-      if(remoteTime > localTime + 2000) await runPullFromSupabase(true);
+      const localTime = lastKnownRemoteTime ? new Date(lastKnownRemoteTime).getTime() : 0;
+      if(remoteTime > localTime + 2000) await runPullNow(true);
     }catch(e){ /* falha silenciosa: tenta de novo no próximo ciclo */ }
   }, SYNC_AUTO_PULL_EVERY);
 }
-
-function saveSyncField(field, value){
-  saveSyncCfg({ [field]: value });
-}
-window.saveSyncField = saveSyncField;
-
-function toggleSyncAuto(){
-  const cfg = loadSyncCfg();
-  const url = cleanSupabaseUrl(cfg.url);
-  if(!cfg.auto && (!url || !cfg.key)){ showToast("Preencha a URL e a chave do Supabase antes de ativar"); return; }
-  saveSyncCfg({ auto: !cfg.auto });
-  if(!cfg.auto) startAutoPull();
-  openSubpage("config");
-}
-window.toggleSyncAuto = toggleSyncAuto;
 
 function showToast(msg){
   const t = document.getElementById("toast");
@@ -534,6 +632,31 @@ function accountCurrentBalance(acc){
     .filter(t => t.accountId === acc.id && t.status === "pago")
     .reduce((s,t) => s + (t.type === "receita" ? t.value : t.type === "despesa" ? -t.value : 0), 0);
   return (acc.balance || 0) + txSum;
+}
+
+// Calcula o período (início/fim) da fatura ATUALMENTE aberta de um cartão,
+// com base no dia de fechamento cadastrado. Segue o padrão comum no Brasil:
+// a fatura reúne compras desde o dia seguinte ao último fechamento até o
+// fechamento deste ciclo.
+function cardCurrentCycle(card){
+  const today = new Date();
+  const y = today.getFullYear(), m = today.getMonth(), d = today.getDate();
+  const closing = Math.min(Math.max(card.closingDay || 1, 1), 28);
+  let endY = y, endM = m;
+  if(d > closing) endM = m + 1; // já passou do fechamento deste mês: a fatura aberta fecha no mês seguinte
+  const end = new Date(endY, endM, closing);
+  const start = new Date(endY, endM - 1, closing + 1);
+  return { start, end };
+}
+function isoDate(d){ return d.toISOString().slice(0,10); }
+
+// Soma as compras do cartão dentro do ciclo de fatura atualmente aberto.
+function cardInvoiceValue(card){
+  const { start, end } = cardCurrentCycle(card);
+  const s = isoDate(start), e = isoDate(end);
+  return data.transactions
+    .filter(t => t.cardId === card.id && t.type === "despesa" && t.date >= s && t.date <= e)
+    .reduce((sum,t) => sum + t.value, 0);
 }
 
 function despesasPorCategoria(offset){
@@ -670,7 +793,7 @@ window.switchTab = switchTab;
 ================================================================= */
 function badge(emoji,color,size){
   size = size||38;
-  return `<div class="badge" style="width:${size}px;height:${size}px;background:${color}22;font-size:${size*0.5}px;">${emoji}</div>`;
+  return `<div class="badge" style="width:${size}px;height:${size}px;background:color-mix(in srgb, ${color} 22%, transparent);font-size:${size*0.5}px;">${emoji}</div>`;
 }
 function progressBar(pct, color){
   const clamped = Math.min(100, Math.max(0, pct));
@@ -735,6 +858,54 @@ function renderHome(){
         <div><div style="font-size:11.5px;opacity:.65;">Projetado</div><div style="font-size:15px;font-weight:600;margin-top:2px;">${mv(saldoProjetado)}</div></div>
       </div>
     </div>
+
+    ${data.accounts.length ? `
+    <div style="font-size:15px;font-weight:700;margin-bottom:8px;">Saldo por conta</div>
+    <div class="card" style="margin-bottom:14px;padding:6px;">
+      ${data.accounts.map((a,i)=>{
+        const bal = accountCurrentBalance(a);
+        return `<div class="tx-row" style="cursor:pointer;" onclick="switchTab('mais');openSubpage('contas');">
+          ${badge("🏦", bal>=0?"var(--info)":"var(--negative)", 34)}
+          <div style="flex:1;min-width:0;">
+            <div style="font-size:13.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(a.name)}</div>
+            <div style="font-size:11px;color:var(--text-muted);">${esc(a.institution||"")}</div>
+          </div>
+          <div style="font-size:14px;font-weight:700;color:${bal>=0?"var(--text)":"var(--negative)"};">${mv(bal)}</div>
+        </div>`;
+      }).join("")}
+    </div>` : `
+    <div style="font-size:15px;font-weight:700;margin-bottom:8px;">Saldo por conta</div>
+    <div class="card" style="margin-bottom:14px;">
+      <div style="font-size:12.5px;color:var(--text-muted);text-align:center;padding:6px 0;">Nenhuma conta cadastrada ainda. Toque em Mais → Contas para adicionar.</div>
+    </div>`}
+
+    ${data.cards.length ? (()=>{
+      const invoices = data.cards.map(c=>({ card:c, valor: cardInvoiceValue(c) }));
+      const totalFaturas = invoices.reduce((s,i)=>s+i.valor,0);
+      return `
+    <div style="font-size:15px;font-weight:700;margin-bottom:8px;">Faturas dos cartões</div>
+    <div class="card" style="margin-bottom:14px;padding:6px;">
+      ${invoices.map(({card,valor})=>{
+        const { end } = cardCurrentCycle(card);
+        return `<div class="tx-row" style="cursor:pointer;" onclick="switchTab('mais');openSubpage('cartoes');">
+          ${badge("💳","var(--negative)",34)}
+          <div style="flex:1;min-width:0;">
+            <div style="font-size:13.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(card.name)}</div>
+            <div style="font-size:11px;color:var(--text-muted);">Fecha dia ${card.closingDay} · vence dia ${card.dueDay}</div>
+          </div>
+          <div style="font-size:14px;font-weight:700;color:var(--negative);">${mv(valor)}</div>
+        </div>`;
+      }).join("")}
+      <div class="tx-row" style="background:var(--surface-alt);border-radius:10px;border-bottom:none;margin-top:2px;">
+        <div style="flex:1;font-size:13px;font-weight:700;">Fatura total do mês</div>
+        <div style="font-size:16px;font-weight:700;color:var(--negative);">${mv(totalFaturas)}</div>
+      </div>
+    </div>`;
+    })() : `
+    <div style="font-size:15px;font-weight:700;margin-bottom:8px;">Faturas dos cartões</div>
+    <div class="card" style="margin-bottom:14px;">
+      <div style="font-size:12.5px;color:var(--text-muted);text-align:center;padding:6px 0;">Nenhum cartão cadastrado ainda. Toque em Mais → Cartões para adicionar.</div>
+    </div>`}
 
     <div style="display:flex;gap:10px;margin-bottom:14px;">
       <div class="card" style="flex:1;padding:13px;">
@@ -1354,6 +1525,9 @@ function renderMore(){
     ["categorias","layers","Categorias","Organize receitas e despesas"],
     ["config","gear","Configurações","Preferências do app"],
   ];
+  if(currentProfile && currentProfile.is_admin){
+    items.push(["usuarios","users","Usuários","Quem tem acesso a este app (admin)"]);
+  }
   let html = `<div class="screen"><div class="serif" style="font-size:20px;margin-bottom:16px;">Mais opções</div>
   <div style="display:flex;flex-direction:column;gap:10px;">`;
   items.forEach(([key,ic,label,desc])=>{
@@ -1390,8 +1564,9 @@ function openSheet(title, bodyHtml){
 
 function openSubpage(key, silent){
   ui.subpage = key;
-  const titles = {contas:"Contas", cartoes:"", emprestimos:"", congeladas:"Dívidas em standby", metas:"", orcamento:"Orçamento", relatorios:"Relatórios", categorias:"Categorias", config:"Configurações"};
-  const renderers = {contas:renderAccountsPanel, cartoes:renderCards, emprestimos:renderLoansPanel, congeladas:renderFrozenDebtsPanel, metas:renderGoals, orcamento:renderBudgetPanel, relatorios:renderReportsPanel, categorias:renderCategoriesPanel, config:renderSettingsPanel};
+  if(key === "usuarios" && !silent) adminUsersCache = null;
+  const titles = {contas:"Contas", cartoes:"", emprestimos:"", congeladas:"Dívidas em standby", metas:"", orcamento:"Orçamento", relatorios:"Relatórios", categorias:"Categorias", config:"Configurações", usuarios:"Usuários"};
+  const renderers = {contas:renderAccountsPanel, cartoes:renderCards, emprestimos:renderLoansPanel, congeladas:renderFrozenDebtsPanel, metas:renderGoals, orcamento:renderBudgetPanel, relatorios:renderReportsPanel, categorias:renderCategoriesPanel, config:renderSettingsPanel, usuarios:renderUsersPanel};
   openSheet(titles[key], renderers[key]());
 }
 window.openSubpage = openSubpage;
@@ -1968,43 +2143,52 @@ function removeCategory(id){
 }
 window.removeCategory = removeCategory;
 
-function renderSyncSection(){
-  const cfg = loadSyncCfg();
-  const configured = !!(cleanSupabaseUrl(cfg.url) && cfg.key);
-  const lastSync = cfg.lastSyncedAt ? new Date(cfg.lastSyncedAt).toLocaleString("pt-BR") : "nunca";
+/* --- Painel: Usuários (somente administrador) --- */
+function renderUsersPanel(){
+  if(!currentProfile || !currentProfile.is_admin){
+    return `<div style="text-align:center;color:var(--text-muted);font-size:13px;padding:30px 10px;">Só administradores podem ver esta tela.</div>`;
+  }
+  if(adminUsersCache === null){
+    loadAllProfilesForAdmin().then(list=>{
+      adminUsersCache = list;
+      if(ui.subpage === "usuarios") openSubpage("usuarios", true);
+    });
+    return `<div style="text-align:center;color:var(--text-muted);font-size:13px;padding:30px 10px;">Carregando…</div>`;
+  }
+  let html = `<div style="font-size:12.5px;color:var(--text-muted);margin-bottom:14px;line-height:1.5;">
+    Para dar acesso a uma nova pessoa: painel do Supabase → <strong>Authentication → Users → Add user</strong>, defina e-mail e senha, e envie essas credenciais para ela. Assim que a pessoa fizer o primeiro login aqui no app, ela aparece nesta lista automaticamente — com seus próprios dados, separados de todo mundo.
+  </div>`;
+  if(!adminUsersCache.length){
+    html += `<div style="text-align:center;color:var(--text-muted);font-size:12.5px;padding:10px 0;">Nenhum usuário encontrado ainda.</div>`;
+  }
+  adminUsersCache.forEach(u=>{
+    html += `<div class="card" style="margin-bottom:8px;display:flex;align-items:center;gap:10px;">
+      ${badge(u.is_admin?"⭐":"👤", u.is_admin?"var(--accent)":"var(--info)", 34)}
+      <div style="flex:1;min-width:0;">
+        <div style="font-size:13.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(u.email||u.id)}</div>
+        <div style="font-size:11px;color:var(--text-muted);">${u.is_admin?"Administrador":"Usuário"}${u.created_at?" · desde "+fullDate(String(u.created_at).slice(0,10)):""}</div>
+      </div>
+      ${u.id===currentUser.id ? `<div style="font-size:10.5px;color:var(--text-muted);font-weight:600;">você</div>` : ""}
+    </div>`;
+  });
+  return html;
+}
+
+function renderAccountSection(){
+  const lastSync = lastKnownRemoteTime ? new Date(lastKnownRemoteTime).toLocaleString("pt-BR") : "ainda não sincronizado";
   return `
     <div class="card" style="margin-bottom:12px;">
-      <div style="font-size:14px;font-weight:700;margin-bottom:4px;">Sincronização entre aparelhos</div>
+      <div style="font-size:14px;font-weight:700;margin-bottom:4px;">Minha conta</div>
       <div style="font-size:12.5px;color:var(--text-muted);margin-bottom:10px;line-height:1.4;">
-        Use o mesmo Supabase em outro celular/computador para ver os mesmos dados nos dois. <strong>Não é uma mesclagem inteligente</strong>: quem enviar por último apaga o que o outro aparelho tinha mandado antes. A URL e a chave ficam salvas só neste navegador.
+        Conectado como <strong style="color:var(--text);">${esc(currentUser?currentUser.email:"")}</strong>${currentProfile&&currentProfile.is_admin?" · Administrador":""}.
+        Seus dados ficam salvos na nuvem e sincronizam sozinhos entre os aparelhos onde você fizer login com esta conta.
       </div>
-
-      <div class="field"><label class="field-label">URL do projeto Supabase</label>
-        <input value="${esc(cfg.url||"")}" placeholder="https://xxxxx.supabase.co" onchange="saveSyncField('url', this.value)"></div>
-      <div class="field"><label class="field-label">Chave anon (public)</label>
-        <input value="${esc(cfg.key||"")}" placeholder="eyJhbGciOi..." onchange="saveSyncField('key', this.value)"></div>
-      <div class="field"><label class="field-label">Nome da tabela no Supabase</label>
-        <input value="${esc(cfg.table||SYNC_TABLE_DEFAULT)}" placeholder="${SYNC_TABLE_DEFAULT}" onchange="saveSyncField('table', this.value)"></div>
-      <div class="field"><label class="field-label">Identificador deste conjunto de dados</label>
-        <input value="${esc(cfg.rowId||"principal")}" placeholder="principal" onchange="saveSyncField('rowId', this.value)"></div>
-
-      <div class="between" style="margin:4px 0 12px;">
-        <div>
-          <div style="font-size:13px;font-weight:700;">Sincronizar automaticamente</div>
-          <div style="font-size:11px;color:var(--text-muted);">Envia sozinho após alterações e verifica a cada ~20s</div>
-        </div>
-        <button onclick="toggleSyncAuto()" style="width:46px;height:26px;border-radius:13px;background:${cfg.auto?"var(--positive)":"var(--border)"};border:none;cursor:pointer;position:relative;flex-shrink:0;">
-          <div style="width:20px;height:20px;border-radius:10px;background:#fff;position:absolute;top:3px;left:${cfg.auto?23:3}px;transition:left .2s;"></div>
-        </button>
-      </div>
-
       <div style="display:flex;gap:8px;margin-bottom:8px;">
-        <button class="btn-ghost" style="flex:1;" onclick="pushToSupabase()">Enviar agora</button>
-        <button class="btn-ghost" style="flex:1;" onclick="pullFromSupabase()">Puxar agora</button>
+        <button class="btn-ghost" style="flex:1;" onclick="pushNow()">Enviar agora</button>
+        <button class="btn-ghost" style="flex:1;" onclick="pullNow()">Puxar agora</button>
       </div>
-      <div style="font-size:11px;color:var(--text-muted);">
-        ${configured ? `Última sincronização: ${lastSync}` : "Preencha a URL e a chave para ativar"}
-      </div>
+      <div style="font-size:11px;color:var(--text-muted);margin-bottom:12px;">Última sincronização: ${lastSync}</div>
+      <button class="btn-ghost" style="border-color:var(--negative);color:var(--negative);width:100%;" onclick="doLogout()">Sair da conta</button>
     </div>`;
 }
 
@@ -2027,7 +2211,7 @@ function renderSettingsPanel(){
 
     <div class="card" style="margin-bottom:12px;">
       <div style="font-size:14px;font-weight:700;margin-bottom:4px;">Backup</div>
-      <div style="font-size:12.5px;color:var(--text-muted);margin-bottom:10px;">Seus dados ficam só neste aparelho/navegador. Baixe um backup regularmente para não correr o risco de perdê-los.</div>
+      <div style="font-size:12.5px;color:var(--text-muted);margin-bottom:10px;">Seus dados já ficam salvos na nuvem (veja "Minha conta" abaixo), mas um backup local é uma segunda cópia extra de segurança — útil se algo acontecer com sua conta.</div>
       <button class="btn-primary" style="margin-bottom:8px;" onclick="downloadBackup()">Baixar backup completo (.json)</button>
       <label class="btn-ghost" style="display:flex;align-items:center;justify-content:center;cursor:pointer;">
         Restaurar backup
@@ -2035,7 +2219,7 @@ function renderSettingsPanel(){
       </label>
     </div>
 
-    ${renderSyncSection()}
+    ${renderAccountSection()}
 
     <div class="card" style="margin-bottom:12px;">
       <div style="font-size:14px;font-weight:700;margin-bottom:8px;">Exportar dados</div>
@@ -2092,10 +2276,11 @@ function restoreBackupFile(input){
     let parsed;
     try{ parsed = JSON.parse(ev.target.result); }
     catch(err){ alert("Arquivo inválido: selecione um backup .json gerado por este app."); return; }
-    if(!confirm("Isso vai SUBSTITUIR todos os dados atuais pelos dados deste backup. Essa ação não pode ser desfeita. Continuar?")) return;
+    if(!confirm("Isso vai SUBSTITUIR todos os dados atuais (deste aparelho e da nuvem) pelos dados deste backup. Essa ação não pode ser desfeita. Continuar?")) return;
     data = migrateData(parsed);
     persist();
     render();
+    runPushNow(true);
     showToast("Backup restaurado");
   };
   reader.onerror = ()=>{ input.value=""; alert("Não foi possível ler o arquivo."); };
@@ -2104,20 +2289,22 @@ function restoreBackupFile(input){
 window.restoreBackupFile = restoreBackupFile;
 
 function loadDemoData(){
-  if(!confirm("Isso vai SUBSTITUIR os dados atuais por dados de exemplo (fictícios). Continuar?")) return;
+  if(!confirm("Isso vai SUBSTITUIR os dados atuais (deste aparelho e da nuvem) por dados de exemplo (fictícios). Continuar?")) return;
   data = defaultData();
   persist();
   render();
+  runPushNow(true);
   showToast("Dados de exemplo carregados");
 }
 window.loadDemoData = loadDemoData;
 
 function resetAllData(){
-  if(!confirm("Isso vai APAGAR PERMANENTEMENTE todos os seus dados deste aparelho. Essa ação não pode ser desfeita. Tem certeza?")) return;
+  if(!confirm("Isso vai APAGAR PERMANENTEMENTE todos os seus dados (deste aparelho e da nuvem). Essa ação não pode ser desfeita. Tem certeza?")) return;
   if(!confirm("Confirmando mais uma vez: apagar tudo?")) return;
   data = emptyData();
   persist();
   render();
+  runPushNow(true);
   showToast("Todos os dados foram apagados");
 }
 window.resetAllData = resetAllData;
@@ -2245,8 +2432,7 @@ function bindGlobalEvents(){
 /* =================================================================
    Início
 ================================================================= */
-loadData();
-if(loadSyncCfg().auto) startAutoPull();
+initAuth();
 
 if("serviceWorker" in navigator){
   window.addEventListener("load", ()=>{
